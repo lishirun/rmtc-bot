@@ -1,0 +1,4 @@
+{
+  "decision_type": "balanced",
+  "note": "现场只允许改 decision_type；取值必须来自赛前登记的枚举。"
+}

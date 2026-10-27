@@ -1,0 +1,7 @@
+# 强制 LF：从 Windows 编辑后 pushed 到 Ubuntu 也不会出现 \r
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.json text eol=lf
