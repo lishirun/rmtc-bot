@@ -1,157 +1,268 @@
-# rmtc_bot —— RMTC 图灵对决赛参赛程序骨架（C++ / ROS 2 Humble）
+# rmtc_bot
 
-**⚠️ 这份代码在本机（Windows）没有编译器，未经过编译验证。** 第一次 `colcon build` 大概率需要改 1～2 处小问题（多半是 include 或类型推导），属于正常现象，不要慌。
+RMTC 机甲大师图灵对决赛参赛程序：**ROS 2 Humble / C++17**。
 
----
+一个节点完成整套决策：订阅 `/team_X/perception`（JSON 感知）→ 本地计算 → 向
+`/team_X/action` 回填同一 `tick` 与 `session_id`。AI 只用于理解自然语言公告，动作
+全部本地计算，因此 AI 超时不会阻塞动作窗口。
 
-## 1. 它做了什么
-
-| 模块 | 文件 | 说明 |
-|---|---|---|
-| 感知解析 | `src/bot.hpp` | 解析 `/team_X/perception`，把每个实体自带的 9×9 相对字符串还原成**绝对坐标** |
-| 地图记忆 | `src/bot.hpp` | 障碍永久记住；资源看到就记、在视野内消失即视为被采走；敌人不假设实时真值 |
-| 决策 | `src/bot.hpp` | 攻击判定 / 残血逃离 / 任务点 & 资源 BFS / 未知区域探索 / 幻术方向反转 |
-| AI 网关 | `src/llm.{hpp,cpp}` | libcurl 异步请求，1.5s 超时，成功才计配额，失败静默降级 |
-| 主程序 | `src/main.cpp` | 话题收发、tick/session_id 原样回填、换场清缓存、注册心跳 |
-
-**已实现**：双向通信、tick 回填、9×9 坐标还原、BFS 寻路、攻击/防御/等待、任务点、AI 事件理解、危险区规避、幻术反转。
-**没实现**（留给你按策略补）：更聪明的对抗（预判、卡位）、多车协同（你们是单车）、更复杂的事件收益计算（天使恩泽回血点、无双堡垒驻守）。
+当前版本标记：`v9-20261028-unstick`
 
 ---
 
-## 2. 装依赖
+## 1. 目录结构
+
+```
+rmtc-bot/
+├── CMakeLists.txt              # 编译与安装规则
+├── package.xml                 # 包声明与依赖
+├── README.md
+├── config/
+│   └── decision_config.json    # 现场唯一允许修改的文件（decision_type）
+├── launch/
+│   └── contest.launch.py       # 等价于 ros2 run，方便带 output=screen
+├── scripts/
+│   └── run.sh                  # 设好环境变量后一键启动
+└── src/
+    ├── bot.hpp                 # 感知结构体 + 解析 + 地图记忆 + BFS + 决策
+    ├── llm.hpp / llm.cpp       # 统一 AI 网关客户端（libcurl、异步、超时降级）
+    └── main.cpp                # 节点：话题收发、回填 tick、回执学习、异常兜底
+```
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/bot.hpp` | `Perception` 解析（含 9×9 相对坐标还原）、`World` 地图记忆与两段式 BFS、五级优先级决策 |
+| `src/llm.cpp` | POST `<GATEWAY>/v1/chat/completions`，非流式，1.5 s 超时，成功才计配额 |
+| `src/main.cpp` | QoS、注册心跳、换场重置、从 `last_action` 学习障碍、整包 try/catch |
+
+---
+
+## 2. 依赖
 
 ```bash
 sudo apt update
 sudo apt install -y \
   nlohmann-json3-dev libcurl4-openssl-dev \
-  ros-humble-rclpy ros-humble-std-msgs ros-humble-rmw-fastrtps-cpp
+  ros-humble-rclcpp ros-humble-std-msgs ros-humble-rmw-fastrtps-cpp \
+  python3-colcon-common-extensions
 ```
 
-> `nlohmann-json3-dev` 和 `libcurl4-openssl-dev` 必须在**编译前**装好，否则 `find_package` 直接失败。
+| 依赖 | 用途 | 缺失时的现象 |
+| --- | --- | --- |
+| `nlohmann-json3-dev` | 解析感知/构造动作 JSON | `fatal error: nlohmann/json.hpp: No such file` |
+| `libcurl4-openssl-dev` | 调用 AI 网关 | `undefined reference to curl_easy_*` |
+| `ros-humble-rclcpp` | 节点与话题 | `find_package(rclcpp)` 失败 |
+
+---
 
 ## 3. 编译
 
 ```bash
-# 放到工作空间的 src 下
+# 放进工作空间的 src 下（目录名必须是 rmtc-bot 或任意，包名以 package.xml 为准）
 cp -r rmtc-bot ~/ros2_ws/src/
+
+source /opt/ros/humble/setup.bash
 cd ~/ros2_ws
-colcon build --symlink-install --packages-select rmtc_bot
+colcon build --packages-select rmtc_bot
 source install/setup.bash
-ros2 pkg executables rmtc_bot      # 应输出 rmtc_bot contestant
+
+ros2 pkg executables rmtc_bot      # 应输出：rmtc_bot contestant
 ```
 
-只改 `config/decision_config.json` 不需要重编（它是运行时读的）。
+> 改了 `src/` 下的代码必须重新 `colcon build` 并 `source install/setup.bash`。
+> 只改 `config/decision_config.json` 不需要重编（运行时读取）。
 
 ---
 
-## 4. 虚拟机网络（最关键的一步）
+## 4. 运行
 
-裁判机和你的虚拟机必须**在同一网段裸通**，DDS 才能互相发现：
+### 4.1 环境变量
 
-| 虚拟化 | 设置 |
-|---|---|
-| VMware | 虚拟机设置 → 网络适配器 → **桥接（Bridged）**，勾选"复制物理网络连接状态" |
-| VirtualBox | 设置 → 网络 → 连接方式 **Bridged Adapter**，界面名称选你实际连网的那块网卡 |
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RMTC_SEAT` | `A` | 本场席位，决定 `/team_A|B|C|D/...` |
+| `RMTC_TEAM_TOKEN` | 空 | **必填**，本场席位令牌（AI 鉴权）；换场会重新签发 |
+| `RMTC_TEAM_NAME` | `队伍名称` | 注册话题的显示名，1–96 字节 |
+| `ROS_DOMAIN_ID` | 27 | 与裁判一致 |
+| `ROS_LOCALHOST_ONLY` | 0 | 跨机通信必须为 0 |
+| `RMW_IMPLEMENTATION` | 系统默认 | 建议 `rmw_fastrtps_cpp`，与裁判一致 |
+| `RMTC_AI_URL` | `http://127.0.0.1:8000/v1/chat/completions` | 联调时改 `127.0.0.1:8080`，比赛用主办方地址 |
+| `RMTC_AI_MODEL` | 空 | 留空 = 主办方默认模型（推荐留空） |
+| `RMTC_AI_MAX_CALLS` | 40 | 本地配额上限（正式配额以赛前公告为准） |
+| `RMTC_DECISION_CONFIG` | `decision_config.json` | 策略文件路径 |
+| `RMTC_DEBUG` | 空 | 设为任意值 → 每 Tick 打一行日志 |
 
-**不要用 NAT**——NAT 下裁判机主动连不进你的虚拟机，表现就是"有话题、没感知"。
-
-自检：
-
-```bash
-ip a                      # 应该是 192.168.x.x 这种内网地址，不是 10.0.2.15（NAT 典型地址）
-ping <裁判机IP>            # 通
-```
-
-防火墙如果开着，先关掉或放行 DDS：
-```bash
-sudo ufw status && sudo ufw disable     # 比赛环境内网，直接关最省事
-```
-
----
-
-## 5. 联调步骤（按裁判教程 v1.1）
+### 4.2 启动
 
 ```bash
-# 1) 准备测试裁判
-sha256sum -c rmtc_practice.sha256
-tar xzf rmtc_practice.tar.gz && cd rmtc_practice
-./start_referee.sh --stage 1
-# 浏览器打开 http://127.0.0.1:8080
+export ROS_DOMAIN_ID=27 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+       RMTC_SEAT=A RMTC_TEAM_TOKEN=practice-A \
+       RMTC_AI_URL=http://127.0.0.1:8080/v1/chat/completions
 
-# 2) 先用参考车确认环境（不代表你的程序通过）
-./start_bot.sh A '环境验证车'
-# 网页点「开始 / 继续」，看到 Tick 推进即 OK，然后 Ctrl+C 停掉参考车
-
-# 3) 换成自己的程序（同一席位不能同时跑两个！）
-export ROS_DOMAIN_ID=27 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export RMTC_SEAT=A RMTC_TEAM_TOKEN=practice-A
-export RMTC_AI_URL=http://127.0.0.1:8080/v1/chat/completions
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 run rmtc_bot contestant
 ```
 
-**通过标准**（教程第 3.4 节）：默认节奏下持续收感知 → 发动作 → 收到 `last_action` 回执；能自主移动采集；重开后用新 `session_id` 继续；暂停重启后能重新定位。
+或用脚本（会做同样的环境设置）：
 
-第二阶段：
 ```bash
-./start_referee.sh --stage 2 --bots B,C,D     # C,D 也可以不加
+chmod +x scripts/run.sh
+RMTC_TEAM_TOKEN=practice-A ./scripts/run.sh
 ```
-真实 LLM 联调：先退出裁判，`export PRACTICE_LLM_URL/PRACTICE_LLM_KEY/PRACTICE_MODEL`，再 `./start_referee.sh --stage 2 --ai-mode real`。
+
+启动第一行会打印版本标记，**这是确认跑的是不是最新二进制的唯一依据**：
+
+```
+======== BUILD v9-20261028-unstick ========
+seat=A mode=balanced ai=http://127.0.0.1:8080/v1/chat/completions token=(已设置)
+```
 
 ---
 
-## 6. 环境变量
+## 5. 接口（按《选手通信协议》）
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `RMTC_SEAT` | `A` | 本场席位，决定 `/team_A|B|C|D/...` |
-| `RMTC_TEAM_TOKEN` | 空 | **必填**，本场席位令牌（AI 鉴权 + 真实调用资格） |
-| `RMTC_TEAM_NAME` | `队伍名称` | 注册话题里的显示名，1–96 字节 |
-| `ROS_DOMAIN_ID` | `27` | 正式比赛用主办方公布值 |
-| `RMTC_AI_URL` | `http://127.0.0.1:8000/v1/chat/completions` | 联调时改成 `127.0.0.1:8080`，比赛用公布地址 |
-| `RMTC_AI_MODEL` | 空 | 留空 = 用主办方默认模型（推荐留空） |
-| `RMTC_AI_MAX_CALLS` | `40` | 自己设的配额上限，低于官方上限（示例 100） |
-| `RMTC_DECISION_CONFIG` | `decision_config.json` | 策略文件路径 |
+### 5.1 话题与 QoS
+
+| 话题 | 方向 | 可靠性 | 持久性 | 深度 |
+| --- | --- | --- | --- | --- |
+| `/team_X/perception` | 订阅 | RELIABLE | VOLATILE | 1 |
+| `/team_X/action` | 发布 | RELIABLE | VOLATILE | 1 |
+| `/team_X/registration` | 发布 | RELIABLE | TRANSIENT_LOCAL | 1 |
+| `/referee/mission` | 订阅 | RELIABLE | TRANSIENT_LOCAL | 1 |
+| `/referee/event_text` | 订阅 | RELIABLE | TRANSIENT_LOCAL | **128** |
+| `/referee/team_registry` | 订阅 | RELIABLE | TRANSIENT_LOCAL | 1 |
+
+所有消息类型均为 `std_msgs/msg/String`；感知/动作/注册的 `data` 是 JSON，任务与事件公告是纯文本。
+
+### 5.2 动作
+
+```json
+{"tick":148,"session_id":"example-match","action":"move","direction":"right"}
+{"tick":148,"session_id":"example-match","action":"attack","direction":"up"}
+{"tick":148,"session_id":"example-match","action":"defend"}
+{"tick":148,"session_id":"example-match","action":"wait"}
+```
+
+- `tick` 必须是**整数**且等于所依据感知的 `tick`；`session_id` 必须是**字符串**，原样回填
+- `move`/`attack` 必须带方向；单条消息 ≤ 4096 字节
+- 每 Tick 只发一条，不做批量补发
+
+### 5.3 感知里最容易搞错的两处
+
+1. `self.position` 是**绝对坐标数组** `[x,y]`；`visible_entities[].position` 是**九行字符串**
+   （81 格 + 8 换行 = 89 字符，无末尾换行，`1` 固定在第 5 行第 5 列，`2` 是该实体）。
+2. 阵亡时 `visible_entities` 为空，**不能**据此认为"视野内的资源都被采走了"。
 
 ---
 
-## 7. 现场唯一能改的东西
+## 6. 决策逻辑
 
-`config/decision_config.json` 里的 `decision_type`：
+### 6.1 五级优先级
+
+| 优先级 | 行为 | 条件 | 日志 `goal=` |
+| --- | --- | --- | --- |
+| 1 | 攻击 | 直线 1–2 格内有敌车，且（己方 HP ≥ 40 或敌车 ≤ 20） | `attack` |
+| 2 | 脱离 | 受击后 HP ≤ 30 | `flee` |
+| 3 | 去任务点 | 资源价值 ≥ 120，或 tick ≥ 400 | `reach` |
+| 4 | 采集 | 按"距离 + 敌人威胁"排序，逐个试可达性 | `res` |
+| 5 | 猎杀 / 探索 | 无资源可采：先找能打赢的敌车，再探索未知区 | `hunt` / `explore` |
+
+优先级 3 的依据是计分公式：资源分满分需 120 价值（30 分），而到达任务点只有 5 分。
+
+### 6.2 两个工程细节
+
+- **两段式 BFS**：先只走"已知可通行"格，走不通再允许穿过未知区，减少撞墙浪费的 Tick。
+- **从回执学障碍**：`self.last_action` 报 `moved=false` + `E_BLOCKED`/`E_OOB` 时，把那个格子标记为
+  临时禁行 15 Tick，日志打印 `学到障碍：(x,y) 走不通，回避 15 Tick`。
+
+### 6.3 可调参数
+
+`config/decision_config.json` 只放一个字段（现场只允许改它）：
+
+```json
+{ "decision_type": "balanced" }
+```
 
 | 取值 | 行为 |
-|---|---|
-| `balanced` | 默认：血量 ≥40 时能打就打，否则跑 |
-| `collect` | 只采集，绝不主动开战（分数落后时保底用） |
-| `defensive` | 血量 ≥70 才反击 |
-| `aggressive` | 血量 ≥15 就打 |
+| --- | --- |
+| `balanced` | 默认：HP ≥ 40 能打就打，否则脱离 |
+| `collect` | 只采集，绝不主动开战 |
+| `aggressive` | HP ≥ 15 就打 |
+| `defensive` | HP ≥ 70 才反击 |
 
-**这 4 个枚举必须赛前向裁判登记**，现场只能改这个值，不能改代码/算法/Prompt。
+> 这四个枚举必须在**赛前**向裁判登记；现场只能改这个值，不得改代码/算法/Prompt。
 
----
-
-## 8. 排查对照表
-
-| 现象 | 原因 |
-|---|---|
-| 网页有"感知 Tick"，程序收不到 | 虚拟机 NAT / ROS_DOMAIN_ID 不对 / 席位写错 |
-| 有"动作 Tick"但"执行 Tick"不涨 | tick 或 session_id 没和感知一致（看 `self.last_action.error`） |
-| `session_mismatch` | 缓存了上一场的 session_id，或自己生成了 session_id |
-| 车不动 | 检查 `last_action.moved=false` 与 `error`；`E_BLOCKED` 说明前方被占 |
-| AI 一直 401 | 令牌席位不匹配，或 Bearer 头没带 |
-| AI 429 | 配额用尽或并发超限（本程序限制 1 个在途） |
-| 编译报错找不到 nlohmann/json.hpp | 忘了 `apt install nlohmann-json3-dev` |
-| 编译报错找不到 curl | 忘了 `libcurl4-openssl-dev` |
-
-日志位置：网页"本场日志"，或 `~/.rmtc-practice/` 下的 `communication.jsonl`、`ai.jsonl`。
+代码内还可调（需重编）：`kMaxCallsPerSession`（本场 AI 调用上限，默认 25）、
+`kAskCooldownTicks`（两次调用最小间隔，默认 40 Tick）。
 
 ---
 
-## 9. 交付前检查
+## 7. 本地验证
 
-- [ ] 两个阶段都在默认 Tick 节奏下跑通
-- [ ] 感知 → 动作 → 回执 三个环节都验证过（截图/录屏，10 月 31 日 20:00 前交）
-- [ ] 第二阶段用过**真实** LLM（不是模拟模式）
-- [ ] 暂停恢复、重开、进程重启后都能恢复控制
-- [ ] 代码里没有任何写死的令牌/场次 ID/地图/事件时间
-- [ ] 材料里不含密钥或正式令牌
+### 7.1 用官方练习裁判
+
+```bash
+# 终端 1：裁判（第二阶段 + 三台陪练）
+cd ~/rmtc/dist/rmtc_practice && ./start_referee.sh --stage 2 --bots B,C,D
+# 浏览器打开 http://127.0.0.1:8080
+
+# 终端 2：本程序（环境变量见 4.2）
+ros2 run rmtc_bot contestant
+
+# 浏览器：部署新练习 → 开始 / 继续
+```
+
+### 7.2 三个灯都要亮
+
+| 位置 | 期望 | 不亮说明 |
+| --- | --- | --- |
+| 终端日志 | `tick=0 hp=100 pos=(1,1) act=move right goal=res` 持续刷新 | 没收到感知（域名/席位/网络） |
+| 网页"感知 Tick" | 涨 | 裁判没在跑 |
+| 网页"动作 Tick" | 涨 | 动作没发出去或发错话题 |
+| 网页"**执行 Tick**" | 涨 | `tick`/`session_id` 没对上，看 `self.last_action.error` |
+
+### 7.3 已知实测结果
+
+| 场景 | 结果 |
+| --- | --- |
+| 第一阶段（18×18，A 单车） | tick=90 采满 200/200 价值 → **40/40** |
+| 第二阶段（A + 三台陪练） | 资源 60 + 有效伤害 900 + 三项任务 → **约 45/60** |
+
+---
+
+## 8. 常见问题
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 网页有感知、程序无日志 | 域号不同 / `ROS_LOCALHOST_ONLY=1` / 跨机网络不通 | 两边统一 `ROS_DOMAIN_ID`，设 `ROS_LOCALHOST_ONLY=0`，关掉多余网卡 |
+| 有动作 Tick、执行 Tick 不涨 | `tick` 或 `session_id` 与感知不一致 | 不要自己生成 session_id，逐帧回填 |
+| 程序一直 `act=wait` | 没收到感知，或 `decide` 找不到路径 | 看日志有没有 `goal=none`；确认感知在刷新 |
+| 换场后车不动 | 新场次 tick 从 0 开始 | 已处理：换场重置 `last_tick_`，且 `tick==0` 无条件接受 |
+| AI 一直 401 | 令牌与席位不匹配 | 用本场席位令牌；换场后令牌会失效 |
+| AI 429 | 配额耗尽或并发超限 | 程序限 1 个在途；降低调用频次或换场 |
+| 编译报 `nlohmann/json.hpp` 找不到 | 少装 `nlohmann-json3-dev` | 见第 2 节 |
+| 改了代码但行为没变 | 没重编 / 跑的是旧二进制 | 看启动第一行 `BUILD` 标记；`colcon build --packages-select rmtc_bot` |
+
+---
+
+## 9. 已知限制
+
+- **事件收益未充分利用**：目前只把随机事件当作"危险区"绕开，"天使恩泽"回血点与"天下无双"堡垒
+  的收益没有专门跑一趟。
+- **资源采集依赖对手速度**：18×18 图上 4 台车抢 16 个资源，开局约 10 秒即被抢空，之后靠猎杀补分。
+- **AI 只验证了链路**：本地用模拟网关验证了 HTTP 与解析，真实模型效果需在主办方网关上再调。
+- **对抗靠"能打就打"**：没有用双方 HP/距离做换血评估，劣势时是"掉到 30 HP 才跑"。
+
+---
+
+## 10. 版本记录
+
+| 标记 | 主要改动 |
+| --- | --- |
+| `v5` | 基线：接入 + 解析 + 采集 |
+| `v6` | 采集优先：资源价值 ≥120 才去任务点 |
+| `v7` | 资源抢光后主动猎杀（`goal=hunt`） |
+| `v8` | 异常兜底、阵亡不清记忆、两段式 BFS |
+| `v9` | 从 `last_action` 学障碍，修复长时间撞墙 |
+
+每次改代码都要同步修改 `src/main.cpp` 里的 `kBuildTag`，否则无法确认现场跑的是哪一版。

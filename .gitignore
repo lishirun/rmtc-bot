@@ -1,0 +1,21 @@
+# ROS2 构建产物（可再生成，不进仓库）
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器/系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地密钥与令牌（绝对不能提交）
+*.pem
+.env
+token*.txt

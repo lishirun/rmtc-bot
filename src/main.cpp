@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -28,6 +29,10 @@ std::string env_or(const char* k, const std::string& def) {
   const char* v = std::getenv(k);
   return (v != nullptr && v[0] != '\0') ? std::string(v) : def;
 }
+
+// 版本标记：启动日志第一行会打印它。跑的不是新程序时，第一眼就能看出来。
+// 每次改代码都要改这个字符串，update-bot.sh 会校验它有没有进二进制。
+constexpr const char* kBuildTag = "v9-20261028-unstick";
 
 // 现场只允许改 decision_config.json 里的 decision_type
 std::string load_mode() {
@@ -59,6 +64,7 @@ class Bot : public rclcpp::Node {
     seat_ = env_or("RMTC_SEAT", "A");
     team_name_ = env_or("RMTC_TEAM_NAME", "队伍名称");
     mode_ = load_mode();
+    debug_ = !env_or("RMTC_DEBUG", "").empty();
 
     const std::string ai_url =
         env_or("RMTC_AI_URL", "http://127.0.0.1:8000/v1/chat/completions");
@@ -69,6 +75,8 @@ class Bot : public rclcpp::Node {
 
     auto qos_data = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
     auto qos_keep = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    // 协议 §2 表：事件公告是 RELIABLE + TRANSIENT_LOCAL + 历史深度 128
+    auto qos_event = rclcpp::QoS(rclcpp::KeepLast(128)).reliable().transient_local();
 
     sub_perception_ = create_subscription<std_msgs::msg::String>(
         "/team_" + seat_ + "/perception", qos_data,
@@ -81,7 +89,7 @@ class Bot : public rclcpp::Node {
 
     // 事件与任务是纯文本公告；事件话题 depth 128，允许重复内容，不要当 JSON 解析
     sub_event_ = create_subscription<std_msgs::msg::String>(
-        "/referee/event_text", qos_keep,
+        "/referee/event_text", qos_event,
         [this](std_msgs::msg::String::SharedPtr msg) { judge_event_text_ = msg->data; });
     sub_mission_ = create_subscription<std_msgs::msg::String>(
         "/referee/mission", qos_keep,
@@ -91,6 +99,7 @@ class Bot : public rclcpp::Node {
                                    [this]() { publish_registration(); });
     publish_registration();
 
+    RCLCPP_INFO(get_logger(), "======== BUILD %s ========", kBuildTag);
     RCLCPP_INFO(get_logger(), "seat=%s mode=%s ai=%s token=%s", seat_.c_str(),
                 mode_.c_str(), ai_url.c_str(),
                 ai_token_.empty() ? "(未设置)" : "(已设置)");
@@ -108,7 +117,36 @@ class Bot : public rclcpp::Node {
   }
 
   // ---------------------------------------------------------------- 主循环
+  // 关键防护：任何异常都不能让进程退出 —— 比赛一崩这场就废了。
   void on_perception(const std::string& raw) {
+    try {
+      handle_perception(raw);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "感知处理异常：%s", e.what());
+      publish_wait();
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "感知处理出现未知异常");
+      publish_wait();
+    }
+  }
+
+  // 兜底：异常时尽量回一条 WAIT（比什么都不发安全，裁判会按未提交处理）
+  void publish_wait() {
+    if (last_tick_ < 0 || session_.empty()) return;
+    try {
+      nlohmann::json j;
+      j["tick"] = last_tick_;
+      j["session_id"] = session_;
+      j["action"] = "wait";
+      std_msgs::msg::String out;
+      out.data = j.dump();
+      pub_action_->publish(out);
+    } catch (...) {
+      // 兜底失败也没办法了，别再抛
+    }
+  }
+
+  void handle_perception(const std::string& raw) {
     auto parsed = rmtc::parse_perception(raw);
     if (!parsed) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "感知解析失败，本 Tick 不发动作");
@@ -116,21 +154,30 @@ class Bot : public rclcpp::Node {
     }
     const rmtc::Perception& p = *parsed;
 
-    if (p.tick < last_tick_) return;  // 迟到的感知直接丢弃
-    last_tick_ = p.tick;
-
-    if (p.session_id != session_) {  // 换场：清空上一场的缓存
+    // 换场必须先处理：新场次的 tick 从 0 重新开始，
+    // 若先做 tick 比较，新场次的 0..旧tick 全会被误判成迟到消息丢弃。
+    if (p.session_id != session_) {
       session_ = p.session_id;
+      last_tick_ = -1;
       world_ = rmtc::World();
       insight_ = rmtc::Insight();
       asked_mission_.clear();
       asked_event_.clear();
       last_ask_tick_ = -1000;
-      RCLCPP_INFO(get_logger(), "新场次 session_id=%s", session_.c_str());
+      session_calls_ = 0;
+      RCLCPP_INFO(get_logger(), "新场次 session_id=%s（收到首帧 tick=%d）",
+                  session_.c_str(), p.tick);
     }
+
+    // 同场次内丢弃迟到消息；但 tick==0 永远接受 ——
+    // 裁判在"部署新练习"时可能先发一条带旧 tick 的暂停快照，不能让它挡住真正开局的 tick=0。
+    if (p.tick < last_tick_ && p.tick != 0) return;
+    last_tick_ = p.tick;
+    if (p.tick == 0) RCLCPP_INFO(get_logger(), "进场，开始执行策略");
 
     world_.init(p.map_w, p.map_h);
     world_.observe(p);
+    learn_from_receipt(p);
 
     maybe_ask_llm(p);
     poll_llm(p.tick);
@@ -140,21 +187,51 @@ class Bot : public rclcpp::Node {
     std_msgs::msg::String out;
     out.data = rmtc::action_to_json(p, d);
     pub_action_->publish(out);
+    // 记下这条指令的出发格与方向，下一帧回执如果 moved=false 就能反推出哪个格子走不通
+    last_cmd_x_ = p.self_x;
+    last_cmd_y_ = p.self_y;
+    last_cmd_dir_ = d.dir;
+    last_cmd_ok_ = (d.action == "move");
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                         "tick=%d hp=%d pos=(%d,%d) act=%s %s | dmg=%.0f res=%.0f ai=%d",
-                         p.tick, p.hp, p.self_x, p.self_y, d.action.c_str(),
-                         d.dir.c_str(), p.effective_damage, p.resource_value,
-                         llm_->calls());
+    // 每 10 Tick 打一行（stage1 共 100 Tick），RMTC_DEBUG=1 时每帧都打
+    if (debug_ || p.tick % 10 == 0) {
+      RCLCPP_INFO(get_logger(),
+                  "tick=%d hp=%d pos=(%d,%d) act=%s %s goal=%s | dmg=%.0f res=%.0f ai=%d",
+                  p.tick, p.hp, p.self_x, p.self_y, d.action.c_str(),
+                  d.dir.c_str(), d.goal.c_str(), p.effective_damage, p.resource_value,
+                  llm_->calls());
+    }
+  }
+
+  // ---------------------------------------------------------------- 学习
+  // 回执里 moved=false 且 error=E_BLOCKED/E_OOB，说明"上一帧从 (x,y) 朝 dir 走"的那格走不通。
+  // 记成临时禁行，避免一直撞同一面墙（实测会白白浪费 10~20 个 Tick）。
+  void learn_from_receipt(const rmtc::Perception& p) {
+    if (!last_cmd_ok_) return;
+    if (p.last_moved) return;
+    if (p.last_action != "move") return;
+    if (p.last_error != "E_BLOCKED" && p.last_error != "E_OOB") return;
+    int nx = last_cmd_x_, ny = last_cmd_y_;
+    if (last_cmd_dir_ == "up") --ny;
+    else if (last_cmd_dir_ == "down") ++ny;
+    else if (last_cmd_dir_ == "left") --nx;
+    else if (last_cmd_dir_ == "right") ++nx;
+    else return;
+    world_.mark_temp_block({nx, ny}, p.tick + 15);
+    RCLCPP_INFO(get_logger(), "学到障碍：(%d,%d) 走不通，回避 15 Tick", nx, ny);
   }
 
   // ---------------------------------------------------------------- LLM
   void maybe_ask_llm(const rmtc::Perception& p) {
     if (!llm_->enabled() || llm_->busy()) return;
+    if (session_calls_ >= kMaxCallsPerSession) return;  // 本场配额上限，绝不烧光
     const std::string mission = p.mission_text.empty() ? judge_mission_text_ : p.mission_text;
     const std::string event = p.event_text.empty() ? judge_event_text_ : p.event_text;
     if (mission == asked_mission_ && event == asked_event_) return;
-    if (p.tick - last_ask_tick_ < 10) return;  // 冷却，避免把配额烧光
+    // 公告会随比赛不断累积（event_text 越变越长），必须限频，
+    // 否则一场就能打出上百次调用，正式比赛配额（示例 100）瞬间耗尽。
+    if (p.tick - last_ask_tick_ < kAskCooldownTicks) return;
+    if (p.tick < 5 && !asked_mission_.empty()) return;
 
     std::string prompt;
     prompt += "你是机器人决策助手。根据赛场公告判断危险区域、方向反转和任务目标。\n";
@@ -169,7 +246,9 @@ class Bot : public rclcpp::Node {
       asked_mission_ = mission;
       asked_event_ = event;
       last_ask_tick_ = p.tick;
-      RCLCPP_INFO(get_logger(), "已发起 AI 调用（第 %d 次）", llm_->calls() + 1);
+      ++session_calls_;
+      RCLCPP_INFO(get_logger(), "已发起 AI 调用（全局第 %d 次，本场第 %d/%d 次）",
+                  llm_->calls() + 1, session_calls_, kMaxCallsPerSession);
     }
   }
 
@@ -189,7 +268,16 @@ class Bot : public rclcpp::Node {
   }
 
   // ---------------------------------------------------------------- 成员
+  static constexpr int kMaxCallsPerSession = 25;  // 本场 AI 调用上限（正式配额示例为 100）
+  static constexpr int kAskCooldownTicks = 40;    // 两次调用最小间隔（10s @500ms/Tick）
+
   std::string seat_, team_name_, mode_, ai_token_, session_;
+  bool debug_ = false;
+  int session_calls_ = 0;
+  // 上一条指令的出发格与方向（用于从 moved=false 回执反推障碍）
+  int last_cmd_x_ = -1, last_cmd_y_ = -1;
+  std::string last_cmd_dir_;
+  bool last_cmd_ok_ = false;
   std::string judge_event_text_, judge_mission_text_;
   std::string asked_mission_, asked_event_;
   int last_ask_tick_ = -1000;

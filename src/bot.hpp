@@ -232,6 +232,9 @@ struct World {
   int w = 24, h = 24;
   std::vector<uint8_t> cell;
   std::map<Pos, int> res;  // 资源位置 -> 价值（10/20）
+  // 从"移动失败回执"学到的临时禁行格：值 = 到期 tick。
+  // 没有它，程序会一直往同一个撞不动的格子走（日志里出现过卡 20 Tick）。
+  std::map<Pos, int> temp_block;
 
   void init(int width, int height) {
     if (width == w && height == h && !cell.empty()) return;
@@ -239,7 +242,10 @@ struct World {
     h = std::max(1, height);
     cell.assign(static_cast<size_t>(w) * h, C_UNKNOWN);
     res.clear();
+    temp_block.clear();
   }
+
+  void mark_temp_block(Pos q, int until_tick) { temp_block[q] = until_tick; }
 
   bool in(int x, int y) const { return x >= 0 && y >= 0 && x < w && y < h; }
   bool walkable(int x, int y) const {
@@ -252,6 +258,9 @@ struct World {
   // 用当前视野更新记忆：障碍记住、资源记住、资源在视野内消失即视为已被采走
   void observe(const Perception& p) {
     mark(p.self_x, p.self_y, C_FREE);
+    // 阵亡时 visible_entities 为空；若继续执行下面"视野内没看到就当已被采走"的逻辑，
+    // 会把死亡点附近记过的资源全部误删，复活后就成了瞎子。所以阵亡帧只更新自身格。
+    if (!p.alive) return;
     std::map<Pos, int> seen_res;
     for (const auto& e : p.entities) {
       if (!in(e.x, e.y)) continue;
@@ -297,8 +306,10 @@ struct World {
   }
 
   // BFS：返回从 from 迈出的第一步；到不了返回 nullopt
+  // allow_unknown=false 时只走"已知可通行"的格子，用来避免盲走撞墙浪费 Tick
   std::optional<Pos> first_step(Pos from, const std::vector<Pos>& targets,
-                                const std::vector<Pos>& blocked) const {
+                                const std::vector<Pos>& blocked,
+                                bool allow_unknown = true) const {
     if (targets.empty()) return std::nullopt;
     const size_t n = static_cast<size_t>(w) * h;
     std::vector<char> is_t(n, 0), ban(n, 0), seen(n, 0);
@@ -306,6 +317,14 @@ struct World {
       if (in(t.first, t.second)) is_t[static_cast<size_t>(t.second) * w + t.first] = 1;
     for (const auto& b : blocked)
       if (in(b.first, b.second)) ban[static_cast<size_t>(b.second) * w + b.first] = 1;
+
+    auto passable = [&](int x, int y) {
+      if (!walkable(x, y)) return false;
+      if (!allow_unknown &&
+          cell[static_cast<size_t>(y) * w + x] == C_UNKNOWN)
+        return false;
+      return true;
+    };
 
     std::vector<Pos> step_of(n, {-1, -1});
     std::vector<Pos> q;
@@ -315,7 +334,7 @@ struct World {
 
     for (int i = 0; i < 4; ++i) {
       const int nx = from.first + dx[i], ny = from.second + dy[i];
-      if (!walkable(nx, ny) || !in(nx, ny)) continue;
+      if (!passable(nx, ny)) continue;
       const size_t id = static_cast<size_t>(ny) * w + nx;
       if (ban[id] || seen[id]) continue;
       seen[id] = 1;
@@ -329,7 +348,7 @@ struct World {
       if (is_t[cid]) return step_of[cid];
       for (int i = 0; i < 4; ++i) {
         const int nx = c.first + dx[i], ny = c.second + dy[i];
-        if (!walkable(nx, ny)) continue;
+        if (!passable(nx, ny)) continue;
         const size_t nid = static_cast<size_t>(ny) * w + nx;
         if (ban[nid] || seen[nid]) continue;
         seen[nid] = 1;
@@ -390,6 +409,7 @@ inline Insight parse_insight(const std::string& content, int tick) {
 struct Decision {
   std::string action = "wait";
   std::string dir;
+  std::string goal;  // reach / res / explore / flee / attack / none，仅用于日志与排错
 };
 
 inline void reverse_dir(std::string& d) {
@@ -406,7 +426,7 @@ inline bool mission_done(const Perception& p, const std::string& id) {
 }
 
 // 普通攻击：指定方向直线 1-2 格内最近的存活敌车；障碍不阻断，但出生保护目标会挡枪
-inline bool best_attack(const Perception& p, std::string& out_dir) {
+inline bool best_attack(const Perception& p, std::string& out_dir, int* out_target_hp = nullptr) {
   if (p.protected_) return false;  // 出生保护期间不能 ATTACK
   const char* dirs[4] = {"up", "down", "left", "right"};
   const int dx[4] = {0, 0, -1, 1};
@@ -420,6 +440,7 @@ inline bool best_attack(const Perception& p, std::string& out_dir) {
         if (e.type != "robot") continue;
         if (e.x != tx || e.y != ty) continue;
         if (e.protected_) { ray_dead = true; break; }  // 打不动，还挡住后面
+        if (out_target_hp != nullptr) *out_target_hp = e.hp;
         out_dir = dirs[i];
         return true;
       }
@@ -481,6 +502,9 @@ inline Decision decide(const Perception& p, World& w, const Insight& ins, int ti
   std::vector<Pos> blocked;
   for (const auto& e : p.entities)
     if (e.type == "robot") blocked.push_back({e.x, e.y});
+  // 撞不动的格子短期回避（由 last_action 回执学到）
+  for (const auto& kv : w.temp_block)
+    if (tick < kv.second) blocked.push_back(kv.first);
   for (const auto& z : ins.danger)
     if (tick < z.until_tick)
       for (int x = z.x0; x <= z.x1; ++x)
@@ -492,11 +516,15 @@ inline Decision decide(const Perception& p, World& w, const Insight& ins, int ti
   else if (mode == "defensive") attack_hp = 70; // 只在自己很健康时反击
   else if (mode == "aggressive") attack_hp = 15;
 
-  if (p.seen_enemy && p.hp >= attack_hp) {
-    std::string dir;
-    if (best_attack(p, dir)) {
+  if (p.seen_enemy) {
+    std::string atk_dir;
+    int target_hp = 1000;
+    // 血够就打；敌车只剩 <=20（再一下就能带走）时，即使自己残血也优先收掉
+    if (best_attack(p, atk_dir, &target_hp) &&
+        (p.hp >= attack_hp || target_hp <= 20)) {
       d.action = "attack";
-      d.dir = dir;
+      d.dir = atk_dir;
+      d.goal = "attack";
       return d;  // 攻击不受幻术影响，不反转
     }
   }
@@ -504,18 +532,99 @@ inline Decision decide(const Perception& p, World& w, const Insight& ins, int ti
   // 残血逃离
   if (p.seen_enemy && p.hp <= 30) {
     auto fd = flee_dir(p, w, blocked);
-    if (fd) { d.action = "move"; d.dir = *fd; }
-    else { d.action = "defend"; }
+    if (fd) { d.action = "move"; d.dir = *fd; d.goal = "flee"; }
+    else { d.action = "defend"; d.goal = "defend"; }
   } else {
-    // 目标优先级：任务指定点 > 最近已知资源 > 未知区域探索
-    std::optional<Pos> goal;
-    if (ins.target_x >= 0 && ins.target_y >= 0 && !mission_done(p, "reach_target"))
-      goal = Pos{ins.target_x, ins.target_y};
-    if (!goal) goal = w.nearest_resource({p.self_x, p.self_y}, blocked);
+    // 目标优先级：结构化任务点 > LLM 给的点 > 可达的最近资源 > 未知区域探索
+    // reach 任务的坐标在感知 missions[] 里就有，不依赖 AI 输出。
+    const Mission* reach = nullptr;
+    for (const auto& m : p.missions)
+      if (m.type == "reach" && m.x >= 0 && m.y >= 0) reach = &m;
 
+    const bool reach_done = (reach != nullptr) && mission_done(p, reach->id);
+    // 按计分公式排优先级：资源 30 分需 120 价值（每点价值 0.25 分），
+    // 而 reach 任务只有 5 分。所以先把资源采满，再回头去任务点。
+    const bool res_full = p.resource_value >= 120.0;
+
+    const Pos me{p.self_x, p.self_y};
     std::optional<Pos> step;
-    if (goal) step = w.first_step({p.self_x, p.self_y}, {*goal}, blocked);
-    if (!step) step = w.first_step({p.self_x, p.self_y}, w.unknown_cells(), blocked);
+    // 两段式寻路：先只走"已知可通行"的格子（不撞墙），走不通再允许穿过未知区
+    auto try_step = [&](const std::vector<Pos>& targets) -> std::optional<Pos> {
+      auto s = w.first_step(me, targets, blocked, false);
+      if (!s) s = w.first_step(me, targets, blocked, true);
+      return s;
+    };
+
+    // 1) 任务点：资源分已经吃满，或进入后半程（防止一直采不到又放弃这 5 分）
+    if (reach != nullptr && !reach_done && (res_full || p.tick >= 400)) {
+      step = try_step({Pos{reach->x, reach->y}});
+      if (step) d.goal = "reach";
+    }
+    // 2) LLM 推断的目标点（备用，mock AI 下一般拿不到）
+    if (!step && ins.target_x >= 0 && ins.target_y >= 0 && !reach_done) {
+      step = try_step({Pos{ins.target_x, ins.target_y}});
+      if (step) d.goal = "llm";
+    }
+    // 3) 资源：按"距离 + 敌人威胁"排序逐个试可达性
+    //    （资源被抢光/不可达时不能傻站着，也不能一直盲目探索）
+    if (!step) {
+      std::vector<Pos> cand;
+      cand.reserve(w.res.size());
+      for (const auto& kv : w.res) {
+        if (std::find(blocked.begin(), blocked.end(), kv.first) != blocked.end()) continue;
+        cand.push_back(kv.first);
+      }
+      // 敌人附近扣分：3 格内有几台敌车就罚几次。
+      // 开局前 20 Tick 不罚（先抢近处资源），血量掉到 60 以下罚得更重（保命优先）。
+      const int risk_w = (p.hp < 60) ? 10 : (p.tick <= 20 ? 0 : 6);
+      auto risk = [&p](const Pos& q) {
+        int n = 0;
+        for (const auto& e : p.entities) {
+          if (e.type != "robot") continue;
+          if (std::abs(e.x - q.first) <= 3 && std::abs(e.y - q.second) <= 3) ++n;
+        }
+        return n;
+      };
+      auto cost = [&me, &risk, risk_w](const Pos& q) {
+        return std::abs(q.first - me.first) + std::abs(q.second - me.second) + risk_w * risk(q);
+      };
+      std::sort(cand.begin(), cand.end(),
+                [&cost](const Pos& a, const Pos& b) { return cost(a) < cost(b); });
+      for (const auto& c : cand) {
+        step = try_step({c});
+        if (step) { d.goal = "res"; break; }
+      }
+    }
+    // 4) 场上已经没资源可追 -> 至少把 reach 的 5 分拿到
+    if (!step && reach != nullptr && !reach_done) {
+      step = try_step({Pos{reach->x, reach->y}});
+      if (step) d.goal = "reach";
+    }
+    // 5) 猎杀：资源被抢光、任务也做完了，别浪费剩余 Tick —— 主动去找能打赢的敌车。
+    //    每 20 点伤害 = 0.6 分，100 Tick 的追杀能换回不少分数。
+    if (!step && p.hp > 30 && p.seen_enemy && mode != "collect") {
+      int best_dist = 1 << 30;
+      std::optional<Pos> best_step;
+      for (const auto& e : p.entities) {
+        if (e.type != "robot") continue;
+        if (e.protected_) continue;                       // 打不动
+        if (e.hp > 60 && p.hp < 70) continue;             // 血量没优势就不去惹满血的
+        // 目标点取敌车四邻格（不能直接站到它头上）
+        const std::vector<Pos> ring = {{e.x + 1, e.y}, {e.x - 1, e.y},
+                                       {e.x, e.y + 1}, {e.x, e.y - 1}};
+        auto s = try_step(ring);
+        if (!s) continue;
+        const int dist_e = std::abs(e.x - me.first) + std::abs(e.y - me.second);
+        if (dist_e < best_dist) { best_dist = dist_e; best_step = s; }
+      }
+      if (best_step) { step = best_step; d.goal = "hunt"; }
+    }
+
+    // 6) 探索未知区域
+    if (!step) {
+      step = try_step(w.unknown_cells());
+      if (step) d.goal = "explore";
+    }
 
     if (step) {
       const int dx = step->first - p.self_x;
@@ -525,6 +634,8 @@ inline Decision decide(const Perception& p, World& w, const Insight& ins, int ti
       else if (dx < 0) d.dir = "left";
       else if (dy > 0) d.dir = "down";
       else if (dy < 0) d.dir = "up";
+    } else {
+      d.goal = "none";
     }
   }
 
