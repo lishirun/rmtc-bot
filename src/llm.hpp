@@ -33,6 +33,20 @@ class LlmClient {
   // 取回最近一次完成的结果 (tick, content)；没有则 nullopt
   std::optional<std::pair<int, std::string> > take_result();
 
+  // 换场时清掉上一场遗留的结果 —— 否则旧场次的结论会被带进新场次
+  void drop_pending() {
+    std::lock_guard<std::mutex> lock(mu_);
+    result_.reset();
+  }
+
+  // 取走最近一次失败原因（401/404/429 等），用于现场排错；取走后清空
+  std::string take_error() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string e;
+    e.swap(last_error_);
+    return e;
+  }
+
  private:
   bool post(const std::string& body, std::string& out, long timeout_ms);
 
@@ -44,6 +58,7 @@ class LlmClient {
 
   std::mutex mu_;
   std::optional<std::pair<int, std::string> > result_;
+  std::string last_error_;
 };
 
 }  // namespace rmtc

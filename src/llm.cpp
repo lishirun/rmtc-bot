@@ -52,10 +52,15 @@ bool LlmClient::post(const std::string& body, std::string& out, long timeout_ms)
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
-  if (rc != CURLE_OK) return false;
+  if (rc != CURLE_OK) {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_error_ = std::string("curl ") + curl_easy_strerror(rc);
+    return false;
+  }
   if (code < 200 || code >= 300) {
-    // 401 令牌错 / 429 配额或限流 / 5xx 网关问题 —— 一律降级，不重试
-    std::cerr << "[llm] http " << code << " body=" << out.substr(0, 200) << std::endl;
+    // 401 令牌错 / 404 地址错 / 429 配额或限流 / 5xx 网关问题 —— 一律降级，不重试
+    std::lock_guard<std::mutex> lock(mu_);
+    last_error_ = "http " + std::to_string(code) + " " + out.substr(0, 160);
     return false;
   }
   return true;
@@ -68,13 +73,15 @@ bool LlmClient::ask_async(const std::string& prompt, int tick) {
 
   nlohmann::json req;
   req["stream"] = false;
+  // 参赛手册：模型固定 "deepseek-flash"，输出长度 max_tokens = 512
+  req["model"] = model_.empty() ? "deepseek-flash" : model_;
+  req["max_tokens"] = 512;
   nlohmann::json user_msg;
   user_msg["role"] = "user";
   user_msg["content"] = prompt;
   nlohmann::json msgs = nlohmann::json::array();
   msgs.push_back(user_msg);
   req["messages"] = msgs;
-  if (!model_.empty()) req["model"] = model_;  // 留空则用主办方默认模型
   const std::string body = req.dump();
 
   std::thread([this, body, tick]() {

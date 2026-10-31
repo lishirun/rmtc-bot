@@ -6,7 +6,7 @@ RMTC 机甲大师图灵对决赛参赛程序：**ROS 2 Humble / C++17**。
 `/team_X/action` 回填同一 `tick` 与 `session_id`。AI 只用于理解自然语言公告，动作
 全部本地计算，因此 AI 超时不会阻塞动作窗口。
 
-当前版本标记：`v9-20261028-unstick`
+当前版本标记：`v10-20261031-handbook`
 
 ---
 
@@ -119,6 +119,24 @@ seat=A mode=balanced ai=http://127.0.0.1:8080/v1/chat/completions token=(已设�
 
 ---
 
+### 4.3 第一阶段 / 第二阶段怎么切换
+
+**同一份二进制跑两个阶段，不需要换版本、不需要改代码。** 阶段差异完全由感知内容决定：第一阶段没有敌车和
+任务点（`seen_enemy=false`），决策自然只会产出 `move` / `wait`。
+
+| 阶段 | 裁判侧启动 | 本程序 |
+| --- | --- | --- |
+| 第一阶段（A 席位，100 Tick × 100 ms） | `./start_referee.sh --stage 1` | `ros2 run rmtc_bot contestant` |
+| 第二阶段（A 席位 + B/C/D 陪练，500 Tick × 500 ms） | `./start_referee.sh --stage 2 --bots B,C,D` | 同上，无需改动 |
+
+切换时注意：
+
+- 程序**不必重启**，但换场次后要确认日志打印了新的 `新场次 session_id=...`
+- 裁判若要求重启，`Ctrl+C` 后重新执行启动命令即可（不补发旧动作）
+- 席位变化只改 `RMTC_SEAT`，话题会跟着变（`/team_A/...` → `/team_B/...`），不用改代码
+
+---
+
 ## 5. 接口（按《选手通信协议》）
 
 ### 5.1 话题与 QoS
@@ -220,6 +238,7 @@ ros2 run rmtc_bot contestant
 | 网页"感知 Tick" | 涨 | 裁判没在跑 |
 | 网页"动作 Tick" | 涨 | 动作没发出去或发错话题 |
 | 网页"**执行 Tick**" | 涨 | `tick`/`session_id` 没对上，看 `self.last_action.error` |
+| 日志末段 `回执 move moved=1 err=-` | 有 | 没收到执行回执（检录要求能证明这一条） |
 
 ### 7.3 已知实测结果
 
@@ -264,5 +283,6 @@ ros2 run rmtc_bot contestant
 | `v7` | 资源抢光后主动猎杀（`goal=hunt`） |
 | `v8` | 异常兜底、阵亡不清记忆、两段式 BFS |
 | `v9` | 从 `last_action` 学障碍，修复长时间撞墙 |
+| `v10` | 按参赛手册补 `max_tokens=512`、默认模型 `deepseek-flash`、日志打印执行回执 |
 
 每次改代码都要同步修改 `src/main.cpp` 里的 `kBuildTag`，否则无法确认现场跑的是哪一版。

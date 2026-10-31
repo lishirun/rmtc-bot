@@ -585,8 +585,15 @@ inline Decision decide(const Perception& p, World& w, const Insight& ins, int ti
         }
         return n;
       };
-      auto cost = [&me, &risk, risk_w](const Pos& q) {
-        return std::abs(q.first - me.first) + std::abs(q.second - me.second) + risk_w * risk(q);
+      // 成本 = 距离 + 威胁惩罚 - 价值奖励
+      // 高价值资源（20 分）相当于"近 2 格"：否则会为了省 1 格去抢 10 分资源而放走 20 分的
+      auto cost = [&me, &risk, risk_w, &w](const Pos& q) {
+        int v = 10;
+        const auto it = w.res.find(q);
+        if (it != w.res.end()) v = it->second;
+        const int bonus = (v >= 20) ? 2 : 0;
+        return std::abs(q.first - me.first) + std::abs(q.second - me.second) +
+               risk_w * risk(q) - bonus;
       };
       std::sort(cand.begin(), cand.end(),
                 [&cost](const Pos& a, const Pos& b) { return cost(a) < cost(b); });

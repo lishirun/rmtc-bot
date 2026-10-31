@@ -32,7 +32,7 @@ std::string env_or(const char* k, const std::string& def) {
 
 // 版本标记：启动日志第一行会打印它。跑的不是新程序时，第一眼就能看出来。
 // 每次改代码都要改这个字符串，update-bot.sh 会校验它有没有进二进制。
-constexpr const char* kBuildTag = "v9-20261028-unstick";
+constexpr const char* kBuildTag = "v12-20261031-value";
 
 // 现场只允许改 decision_config.json 里的 decision_type
 std::string load_mode() {
@@ -165,6 +165,9 @@ class Bot : public rclcpp::Node {
       asked_event_.clear();
       last_ask_tick_ = -1000;
       session_calls_ = 0;
+      // 手册：进入新场次后清除上场的规划、动作及过期模型结果
+      last_cmd_ok_ = false;    // 上一场的出发格不能拿来标记新场地图
+      llm_->drop_pending();    // 丢弃上一场遗留的 AI 结论
       RCLCPP_INFO(get_logger(), "新场次 session_id=%s（收到首帧 tick=%d）",
                   session_.c_str(), p.tick);
     }
@@ -194,12 +197,23 @@ class Bot : public rclcpp::Node {
     last_cmd_ok_ = (d.action == "move");
 
     // 每 10 Tick 打一行（stage1 共 100 Tick），RMTC_DEBUG=1 时每帧都打
+    // 末尾带 self.last_action 回执 —— 检录要求能证明"本程序收到并核对了执行回执"
     if (debug_ || p.tick % 10 == 0) {
       RCLCPP_INFO(get_logger(),
-                  "tick=%d hp=%d pos=(%d,%d) act=%s %s goal=%s | dmg=%.0f res=%.0f ai=%d",
+                  "tick=%d hp=%d pos=(%d,%d) act=%s %s goal=%s | dmg=%.0f res=%.0f ai=%d"
+                  " | 任务 %d/%d | 回执 %s moved=%d err=%s",
                   p.tick, p.hp, p.self_x, p.self_y, d.action.c_str(),
                   d.dir.c_str(), d.goal.c_str(), p.effective_damage, p.resource_value,
-                  llm_->calls());
+                  llm_->calls(), p.mission_completed,
+                  static_cast<int>(p.missions.size()),
+                  p.last_action.empty() ? "-" : p.last_action.c_str(),
+                  p.last_moved ? 1 : 0,
+                  p.last_error.empty() ? "-" : p.last_error.c_str());
+    }
+    // 被拒的动作单独提示，复盘和现场排错都靠这一行
+    if (!p.last_error.empty()) {
+      RCLCPP_WARN(get_logger(), "动作被拒：action=%s error=%s（当前 tick=%d）",
+                  p.last_action.c_str(), p.last_error.c_str(), p.tick);
     }
   }
 
@@ -253,9 +267,17 @@ class Bot : public rclcpp::Node {
   }
 
   void poll_llm(int tick) {
+    const std::string err = llm_->take_error();
+    if (!err.empty()) {
+      RCLCPP_WARN(get_logger(), "AI 调用失败：%.200s", err.c_str());
+    }
     auto r = llm_->take_result();
     if (!r) return;
-    if (tick - r->first > 100) return;  // 结果太旧，丢掉
+    // 结果必须来自"当前或更早"的 tick；来自未来的 tick 说明是上一场遗留的结果，必须丢弃
+    if (r->first < 0 || r->first > tick || tick - r->first > 100) {
+      RCLCPP_WARN(get_logger(), "AI 结果 tick=%d 与当前 tick=%d 不匹配，丢弃", r->first, tick);
+      return;
+    }
     rmtc::Insight ins = rmtc::parse_insight(r->second, r->first);
     if (!ins.valid) {
       RCLCPP_WARN(get_logger(), "AI 输出不是合法 JSON，本次忽略：%.120s", r->second.c_str());
